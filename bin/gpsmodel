@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+# -*- mode: python; -*-
+"""Simple program that sets the program model for u-blox 8 / u-blox M8 receivers
+
+This has been tried out on a Raspberry Pi 2 Model B using the Uputronics Raspberry Pi+ GPS Expansion Board
+<https://store.uputronics.com/index.php?route=product/product&path=60_64&product_id=81>.  It claims on
+that page to be able to run on the original RPi 1 Model B+, but I wasn't able to get it working in that
+configuration.
+
+FWIW, the specific board I have says it's a "Raspberry Pi+ ublox GPS Expansion Board v4.1".  The chip on it is a
+ublox MAX-M8Q-0-10.
+
+Terminal settings and save from <https://gist.github.com/SlightlyLoony/d94cce218a9f650e6ad2de6a6ae7550e>
+Defaults and descriptions from 33.10.17 UBX-CFG-NAV5 and C.10 Navigation Settings (UBX-CFG-NAV5)
+<https://www.u-blox.com/sites/default/files/products/documents/u-blox8-M8_ReceiverDescrProtSpec_(UBX-13003221)_Public.pdf>
+
+Like others I was going through the *5 minute guide to making a GPS Locked Stratum 1 NTP Server with a Raspberry Pi*
+<https://ava.upuaut.net/?p=951> and was not excited to compile code just to set the stationary mode which can be accopmlished
+using a script.  Also was not excited about the "magic bytes" aspect of the C code.
+
+"""
+import argparse
+import binascii
+import os
+import sys
+import termios
+from enum import Enum
+from collections import OrderedDict
+
+
+class UBXFrame:
+    """UBXFrame is a data container for the UBX Frame protocol descibed in chapter 33"""
+
+    SYNC = b"\xb5\x62"
+
+    def __init__(self, message_class, message_id, payload):
+        self.message_class = message_class
+        self.message_id = message_id
+        self.payload = payload
+
+    def __eq__(self, other):
+        if isinstance(other, UBXFrame):
+            return (
+                self.message_class == other.message_class
+                and self.message_id == other.message_id
+                and self.payload == other.payload
+            )
+        return NotImplemented
+
+    @property
+    def frame(self):
+        """Creates a UBX frame to be written out"""
+        p_len = len(self.payload)
+        p_len_b = p_len.to_bytes(2, byteorder="little")
+        buf = self.message_class + self.message_id + p_len_b + self.payload
+        cks = self.cksum(buf)
+        return self.SYNC + buf + cks
+
+    @staticmethod
+    def cksum(buf):
+        """Creates a checksum string for the UBX frame"""
+        ck_a = 0
+        ck_b = 0
+        for v in buf:
+            ck_a += v
+            ck_b += ck_a
+            ck_a &= 0xFF
+            ck_b &= 0xFF
+        return ck_a.to_bytes(1, byteorder="little") + ck_b.to_bytes(
+            1, byteorder="little"
+        )
+
+
+# OrderedDict will ensure the order for the frame when written out
+class DynamicPlatformModel(Enum):
+    """DynamicPlatformModel is a collection of model application GPS use cases (UBX-CFG-NAV5).
+    They can be set without restarting the ublox (hence dynamic)."""
+
+    poll = {"description": "Get the current platform model setting."}
+    portable = {
+        "description": "Applications with low acceleration, e.g. portable devices. Suitable for most situations.",
+        "data": OrderedDict(
+            [
+                ("mask", 0x5FF),
+                ("dynModel", 0),
+                ("fixMode", 3),
+                ("fixedAlt", 0),
+                ("fixedAltVar", 1),
+                ("minElev", 5),
+                ("drLimit", 0),
+                ("pDop", 25),
+                ("tDop", 25),
+                ("pAcc", 100),
+                ("tAcc", 350),
+                ("staticHoldThresh", 0),
+                ("dgnssTimeout", 60),
+                ("cnoThreshNumSVs", 0),
+                ("cnoThresh", 0),
+                ("reserved1", 0),
+                ("staticHoldMaxDist", 0),
+                ("utcStandard", 0),
+                ("reserved2", 0),
+            ]
+        ),
+    }
+    stationary = {
+        "description": "Used in timing applications (antenna must be stationary) or other stationary applications."
+        "  Velocity restricted to 0 m/s. Zero dynamics assumed.",
+        "data": OrderedDict(
+            [
+                ("mask", 0x5FF),
+                ("dynModel", 2),
+                ("fixMode", 3),
+                ("fixedAlt", 0),
+                ("fixedAltVar", 1),
+                ("minElev", 5),
+                ("drLimit", 0),
+                ("pDop", 25),
+                ("tDop", 25),
+                ("pAcc", 100),
+                ("tAcc", 350),
+                ("staticHoldThresh", 0),
+                ("dgnssTimeout", 60),
+                ("cnoThreshNumSVs", 0),
+                ("cnoThresh", 0),
+                ("reserved1", 0),
+                ("staticHoldMaxDist", 0),
+                ("utcStandard", 0),
+                ("reserved2", 0),
+            ]
+        ),
+    }
+    pedestrian = {
+        "description": "Applications with low acceleration and speed, e.g. how a pedestrian would move. Low acceleration assumed.",
+        "data": OrderedDict(
+            [
+                ("mask", 0x5FF),
+                ("dynModel", 3),
+                ("fixMode", 3),
+                ("fixedAlt", 0),
+                ("fixedAltVar", 1),
+                ("minElev", 5),
+                ("drLimit", 0),
+                ("pDop", 25),
+                ("tDop", 25),
+                ("pAcc", 100),
+                ("tAcc", 350),
+                ("staticHoldThresh", 0),
+                ("dgnssTimeout", 60),
+                ("cnoThreshNumSVs", 0),
+                ("cnoThresh", 0),
+                ("reserved1", 0),
+                ("staticHoldMaxDist", 0),
+                ("utcStandard", 0),
+                ("reserved2", 0),
+            ]
+        ),
+    }
+    automotive = {
+        "description": "Used for applications with equivalent dynamics to those of a passenger car."
+        " Low vertical acceleration assumed.",
+        "data": OrderedDict(
+            [
+                ("mask", 0x5FF),
+                ("dynModel", 4),
+                ("fixMode", 3),
+                ("fixedAlt", 0),
+                ("fixedAltVar", 1),
+                ("minElev", 5),
+                ("drLimit", 0),
+                ("pDop", 25),
+                ("tDop", 25),
+                ("pAcc", 100),
+                ("tAcc", 350),
+                ("staticHoldThresh", 0),
+                ("dgnssTimeout", 60),
+                ("cnoThreshNumSVs", 0),
+                ("cnoThresh", 0),
+                ("reserved1", 0),
+                ("staticHoldMaxDist", 0),
+                ("utcStandard", 0),
+                ("reserved2", 0),
+            ]
+        ),
+    }
+    sea = {
+        "description": "Recommended for applications at sea, with zero vertical velocity. Zero vertical velocity assumed."
+        " Sea level assumed.",
+        "data": OrderedDict(
+            [
+                ("mask", 0x5FF),
+                ("dynModel", 5),
+                ("fixMode", 3),
+                ("fixedAlt", 0),
+                ("fixedAltVar", 1),
+                ("minElev", 5),
+                ("drLimit", 0),
+                ("pDop", 25),
+                ("tDop", 25),
+                ("pAcc", 100),
+                ("tAcc", 350),
+                ("staticHoldThresh", 0),
+                ("dgnssTimeout", 60),
+                ("cnoThreshNumSVs", 0),
+                ("cnoThresh", 0),
+                ("reserved1", 0),
+                ("staticHoldMaxDist", 0),
+                ("utcStandard", 0),
+                ("reserved2", 0),
+            ]
+        ),
+    }
+    airborne_lt_1g = {
+        "description": "Used for applications with a higher dynamic range and greater vertical acceleration than a passenger car."
+        " No 2D position fixes supported.",
+        "data": OrderedDict(
+            [
+                ("mask", 0x5FF),
+                ("dynModel", 6),
+                ("fixMode", 3),
+                ("fixedAlt", 0),
+                ("fixedAltVar", 1),
+                ("minElev", 5),
+                ("drLimit", 0),
+                ("pDop", 25),
+                ("tDop", 25),
+                ("pAcc", 100),
+                ("tAcc", 350),
+                ("staticHoldThresh", 0),
+                ("dgnssTimeout", 60),
+                ("cnoThreshNumSVs", 0),
+                ("cnoThresh", 0),
+                ("reserved1", 0),
+                ("staticHoldMaxDist", 0),
+                ("utcStandard", 0),
+                ("reserved2", 0),
+            ]
+        ),
+    }
+    airborne_lt_2g = {
+        "description": "Recommended for typical airborne environments. No 2D position fixes supported.",
+        "data": OrderedDict(
+            [
+                ("mask", 0x5FF),
+                ("dynModel", 7),
+                ("fixMode", 3),
+                ("fixedAlt", 0),
+                ("fixedAltVar", 1),
+                ("minElev", 5),
+                ("drLimit", 0),
+                ("pDop", 25),
+                ("tDop", 25),
+                ("pAcc", 100),
+                ("tAcc", 350),
+                ("staticHoldThresh", 0),
+                ("dgnssTimeout", 60),
+                ("cnoThreshNumSVs", 0),
+                ("cnoThresh", 0),
+                ("reserved1", 0),
+                ("staticHoldMaxDist", 0),
+                ("utcStandard", 0),
+                ("reserved2", 0),
+            ]
+        ),
+    }
+    airborne_lt_4g = {
+        "description": "Only recommended for extremely dynamic environments. No 2D position fixes supported.",
+        "data": OrderedDict(
+            [
+                ("mask", 0x5FF),
+                ("dynModel", 8),
+                ("fixMode", 3),
+                ("fixedAlt", 0),
+                ("fixedAltVar", 1),
+                ("minElev", 5),
+                ("drLimit", 0),
+                ("pDop", 25),
+                ("tDop", 25),
+                ("pAcc", 100),
+                ("tAcc", 350),
+                ("staticHoldThresh", 0),
+                ("dgnssTimeout", 60),
+                ("cnoThreshNumSVs", 0),
+                ("cnoThresh", 0),
+                ("reserved1", 0),
+                ("staticHoldMaxDist", 0),
+                ("utcStandard", 0),
+                ("reserved2", 0),
+            ]
+        ),
+    }
+    wrist = {
+        "description": "Only recommended for wrist worn applications. Receiver will filter out arm motion."
+        " (just available for protocol version > 17)",
+        "data": OrderedDict(
+            [
+                ("mask", 0x5FF),
+                ("dynModel", 9),
+                ("fixMode", 3),
+                ("fixedAlt", 0),
+                ("fixedAltVar", 1),
+                ("minElev", 5),
+                ("drLimit", 0),
+                ("pDop", 25),
+                ("tDop", 25),
+                ("pAcc", 100),
+                ("tAcc", 350),
+                ("staticHoldThresh", 0),
+                ("dgnssTimeout", 60),
+                ("cnoThreshNumSVs", 0),
+                ("cnoThresh", 0),
+                ("reserved1", 0),
+                ("staticHoldMaxDist", 0),
+                ("utcStandard", 0),
+                ("reserved2", 0),
+            ]
+        ),
+    }
+
+    @property
+    def nav_settings(self):
+        """composes the UBXFrame with data when present"""
+        payload = b""
+        if "data" in self.value:
+            d = self.value["data"]
+            for k, v in d.items():
+                payload += self.encode_key_value(k, v)
+
+        return UBXFrame(b"\x06", b"\x24", payload)
+
+    @staticmethod
+    def encode_key_value(key, value):
+        """encode value as byte string for key"""
+        s = key in {"fixedAlt", "minElev"}
+        l = 1
+        if key in {"reserved2"}:
+            l = 5
+        elif key in {"fixedAlt", "fixedAltVar"}:
+            l = 4
+        elif key in {
+            "mask",
+            "pDop",
+            "tDop",
+            "pAcc",
+            "tAcc",
+            "reserved1",
+            "staticHoldMaxDist",
+        }:
+            l = 2
+        return value.to_bytes(l, byteorder="little", signed=s)
+
+    @staticmethod
+    def model_overrides():
+        """set of overrideable values for a model"""
+        # NOTE: dynModel not available for override, just choose another model
+        # reserved fields are also not overrideable
+        return {
+            "mask",
+            "fixMode",
+            "fixedAlt",
+            "fixedAltVar",
+            "minElev",
+            "pDop",
+            "tDop",
+            "pAcc",
+            "tAcc",
+            "staticHoldThresh",
+            "dgnssTimeout",
+            "cnoThreshNumSVs",
+            "cnoThresh",
+            "staticHoldMaxDist",
+            "utcStandard",
+        }
+
+
+def sync_idx_val(b, sync_idx):
+    """control to find a sync frame match in input"""
+    if sync_idx < len(UBXFrame.SYNC) and b == UBXFrame.SYNC[sync_idx : sync_idx + 1]:
+        return sync_idx + 1
+    return 0
+
+
+def sync_to_frame(fd):
+    """find the sync frame in input"""
+    k = 0
+    sync_idx = 0
+    while k < 16384 and sync_idx < len(UBXFrame.SYNC):
+        b = os.read(fd, 1)
+        sync_idx = sync_idx_val(b, sync_idx)
+        k += 1
+
+    return k != 16384
+
+
+def read_bytes_or_none(fd, b):
+    """reads up to the specified bytes and return them or return None if not able to read them"""
+    k = 0
+    value = os.read(fd, b)
+    while k < 16384 and len(value) < b:
+        n = b - len(value)
+        value += os.read(fd, n)
+        k += 1
+    if k == 16384:
+        return None
+    return value
+
+
+def read_frame(fd):
+    """once the sync frame is found, read the rest of the frame and return it"""
+    m_class = read_bytes_or_none(fd, 1)
+    if m_class is None:
+        return None
+    m_id = read_bytes_or_none(fd, 1)
+    if m_id is None:
+        return None
+    m_length = read_bytes_or_none(fd, 2)
+    if m_length is None:
+        return None
+
+    val = int.from_bytes(m_length, byteorder="little")
+    payload = read_bytes_or_none(fd, val)
+    if payload is None:
+        return None
+
+    cksum = read_bytes_or_none(fd, 2)
+    if cksum is None:
+        return None
+
+    buf = m_class + m_id + m_length + payload
+    cks = UBXFrame.cksum(buf)
+    if cks != cksum:
+        return None
+
+    return UBXFrame(m_class, m_id, payload)
+
+
+class NullSaver:
+    """class for not saving settings"""
+
+    def __init__(self, _m, _f):
+        pass
+
+    def save(self):
+        pass
+
+
+class Saver:
+    """class for saving settings"""
+
+    def __init__(self, model, fd):
+        self.model = model
+        self.fd = fd
+
+    def save(self):
+        retries = 0
+        saved = False
+        save = UBXFrame(
+            b"\x06", b"\x09", b"\x00\x00\x00\x00\xFF\xFF\x00\x00\x00\x00\x00\x00\x03"
+        )
+        save_ack_ack = UBXFrame(b"\x05", b"\x01", save.message_class + save.message_id)
+        while retries < 5:
+            frame = save.frame
+            print("to_send save: {}".format(binascii.hexlify(frame)))
+            os.write(self.fd, frame)
+
+            if not sync_to_frame(self.fd):
+                print("failed to receive sync for frame")
+                retries += 1
+                continue
+            u = read_frame(self.fd)
+            if not u:
+                print("failed to receive frame")
+                retries += 1
+                continue
+
+            if not save_ack_ack == u:
+                print(
+                    "unexpected reply class: {} id: {} payload: {}".format(
+                        binascii.hexlify(u.message_class),
+                        binascii.hexlify(u.message_id),
+                        binascii.hexlify(u.payload),
+                    )
+                )
+                retries += 1
+                continue
+            print("received save ack ack")
+            saved = True
+            break
+        msg = "FAILED to save GPS model {}"
+        if saved:
+            msg = "saved GPS model {}"
+        print(format(msg.format(self.model.name)))
+
+
+class CfgNav5Getter:
+    """class for getting UBX-CFG-NAV5 models"""
+
+    def __init__(self, model, fd):
+        self.model = model
+        self.fd = fd
+
+    def run(self):
+        ok = False
+        retries = 0
+        to_send = self.model.nav_settings
+        while retries < 5:
+            print(">>>>>>>>>>>>>>>>>>>>> SENDING >>>>>>>>>>>>>>>")
+            frame = to_send.frame
+            print("to_send {}: {}".format(self.model.name, binascii.hexlify(frame)))
+            os.write(self.fd, frame)
+
+            if not sync_to_frame(self.fd):
+                print("failed to receive sync for frame")
+                retries += 1
+                continue
+            u = read_frame(self.fd)
+            if not u:
+                print("failed to receive frame")
+                retries += 1
+                continue
+
+            if not (
+                u.message_class == to_send.message_class
+                and u.message_id == to_send.message_id
+            ):
+                print(
+                    "unexpected reply class: {} id: {} payload: {}".format(
+                        binascii.hexlify(u.message_class),
+                        binascii.hexlify(u.message_id),
+                        binascii.hexlify(u.payload),
+                    )
+                )
+                retries += 1
+                continue
+            print("received ack ack")
+            print(
+                "received {}: {}".format(self.model.name, binascii.hexlify(u.payload))
+            )
+            # TODO: decode
+            ok = True
+            break
+
+        msg = "FAILED to set GPS model {}"
+        if ok:
+            msg = "set GPS model {}"
+        print(format(msg.format(self.model.name)))
+
+        return ok
+
+        return True
+
+
+class CfgNav5Setter:
+    """class for setting UBX-CFG-NAV5 models"""
+
+    def __init__(self, model, fd):
+        self.model = model
+        self.fd = fd
+
+    def run(self):
+        ok = False
+        retries = 0
+        to_send = self.model.nav_settings
+        ack_ack = UBXFrame(b"\x05", b"\x01", to_send.message_class + to_send.message_id)
+        while retries < 5:
+            print(">>>>>>>>>>>>>>>>>>>>> SENDING >>>>>>>>>>>>>>>")
+            frame = to_send.frame
+            print("to_send {}: {}".format(self.model.name, binascii.hexlify(frame)))
+            os.write(self.fd, frame)
+
+            if not sync_to_frame(self.fd):
+                print("failed to receive sync for frame")
+                retries += 1
+                continue
+            u = read_frame(self.fd)
+            if not u:
+                print("failed to receive frame")
+                retries += 1
+                continue
+
+            if not ack_ack == u:
+                print(
+                    "unexpected reply class: {} id: {} payload: {}".format(
+                        binascii.hexlify(u.message_class),
+                        binascii.hexlify(u.message_id),
+                        binascii.hexlify(u.payload),
+                    )
+                )
+                retries += 1
+                continue
+            print("received ack ack")
+            ok = True
+            break
+
+        msg = "FAILED to set GPS model {}"
+        if ok:
+            msg = "set GPS model {}"
+        print(format(msg.format(self.model.name)))
+
+        return ok
+
+
+def main(args):
+    model = DynamicPlatformModel[args.model[0]]
+    cfg_nav5_op_class = CfgNav5Setter
+    if model.name == "poll":
+        args.save = False
+        cfg_nav5_op_class = CfgNav5Getter
+    if args.settings and "data" in model.value:
+        d = model.value["data"]
+        for pair in args.settings:
+            d[pair[0]] = pair[1]
+
+    # open the device and setup for IO
+    fd = os.open(args.device[0], os.O_RDWR)
+    current = termios.tcgetattr(fd)
+
+    current[2] = termios.B9600 | termios.CS8 | termios.CLOCAL | termios.CREAD
+    current[0] = termios.IGNPAR
+    current[1] = 0
+    current[3] = 0
+
+    termios.tcflush(fd, termios.TCIFLUSH)
+    termios.tcsetattr(fd, termios.TCSANOW, current)
+
+    cfg_nav5_op = cfg_nav5_op_class(model, fd)
+
+    ok = cfg_nav5_op.run()
+
+    saver_class = NullSaver
+    if args.save and ok:
+        saver_class = Saver
+
+    saver = saver_class(model, fd)
+    saver.save()
+    os.close(fd)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="get/set u-blox GPS dynamic platform model"
+    )
+    parser.add_argument("--save", action="store_true")
+    parser.add_argument(
+        "--model",
+        type=str,
+        nargs=1,
+        required=True,
+        choices=[name for name, _ in DynamicPlatformModel.__members__.items()],
+        help="dynamic platform model",
+    )
+    parser.add_argument(
+        "--settings",
+        nargs="*",
+        required=False,
+        help="key=value pairs containing dynamic platform model settings."
+        " Keys are: {}".format(
+            ", ".join(sorted(list(DynamicPlatformModel.model_overrides())))
+        ),
+    )
+    parser.add_argument("device", type=str, nargs=1, help="tty device")
+    args = parser.parse_args()
+    if args.settings:
+        new_settings = []
+        valid = DynamicPlatformModel.model_overrides()
+        for pair in args.settings:
+            spl = pair.split("=")
+            if len(spl) != 2:
+                print(
+                    "setting arg '{}' not in key=value form, ignoring".format(pair),
+                    file=sys.stderr,
+                )
+                continue
+            if spl[0] not in valid:
+                print(
+                    "setting key '{}' not valid, ignoring".format(spl[0]),
+                    file=sys.stderr,
+                )
+                continue
+            v = None
+            try:
+                if spl[1].startswith("0x") or spl[1].startswith("0X"):
+                    v = int(spl[1], 16)
+                else:
+                    v = int(spl[1])
+                _ = DynamicPlatformModel.encode_key_value(spl[0], v)
+            except ValueError:
+                print(
+                    "setting value '{}' for key '{}' not an int, ignoring".format(
+                        spl[1], spl[0]
+                    ),
+                    file=sys.stderr,
+                )
+                continue
+            except OverflowError:
+                print(
+                    "setting value '{}' for key '{}' overflows the field, ignoring".format(
+                        spl[1], spl[0]
+                    ),
+                    file=sys.stderr,
+                )
+                continue
+            new_settings.append((spl[0], v))
+        args.settings = new_settings
+    main(args)
