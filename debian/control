@@ -1,0 +1,23 @@
+Source: gpsmodel
+Maintainer: Leo Davis <3577372+ldav1s@users.noreply.github.com>
+Section: python
+Priority: optional
+Build-Depends: debhelper-compat (= 12),
+               dh-python,
+               python3-all,
+               python3-setuptools,
+Standards-Version: 4.1.1
+X-Python3-Version: >= 3.6
+Vcs-Git: https://github.com/ldav1s/gpsmodel.git
+Vcs-Browser: https://github.com/ldav1s/gpsmodel
+
+Package: gpsmodel
+Architecture: all
+Depends: ${misc:Depends}, ${python3:Depends}
+Description: Simple program that sets the program model for u-blox 8 / u-blox M8 receivers
+ The gpsmodel program is a Python 3 command line program that sets the program model
+ for u-blox 8 / u-blox M8 GPS receivers.
+ .
+ This package contains the gpsmodel command line tool.
+
+

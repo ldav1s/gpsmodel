@@ -1,2 +1,9 @@
+.pybuild/
+build/
 dist/
 gpsmodel.egg-info/
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/gpsmodel.substvars
+debian/gpsmodel/
